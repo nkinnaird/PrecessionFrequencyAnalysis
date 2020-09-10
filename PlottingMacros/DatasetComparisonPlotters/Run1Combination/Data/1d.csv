@@ -1,0 +1,36 @@
+Uncertainty source,Boston/T,Boston/R,Cornell/T,Cornell/A,Europa/T,Europa/A,Kentucky/Q,STJU/T,STJU/A,Washington/T,Washington/A
+Input clock stability,0,0,0,0,0,0,0,0,0,0,0
+Input clock upconversion factor,2,2,2,2,2,2,2,2,2,2,2
+Time correction,0,0,2,2,0,0,0,0,0,0,0
+Cluster time assignment,1,1,0,0,1,1,0,1,1,1,1
+In-fill gain amplitude,2,1,2,2,13,24,8,9,5,14,10
+In-fill gain time constant,13,7,11,8,0,0,2,7,3,0,0
+STDP gain amplitude,0,0,0,0,,,0,0,0,1,3
+STDP gain time constant,0,0,1,1,,,0,0,0,0,0
+Residual gain variation,19,7,3,2,9,6,0,58,38,12,7
+Pileup covariance matrix,0,0,0,0,0,0,15,0,0,0,0
+Pileup amplitude,10,9,1,1,10,8,0,8,7,10,6
+Pileup cluster time model,5,5,0,0,22,82,0,7,41,0,0
+Pileup cluster energy model,10,7,0,0,,,0,,,0,0
+Pileup phase,0,0,0,0,0,0,0,0,0,4,35
+Pileup time/energy bias,0,0,0,0,0,0,0,0,0,0,0
+Pileup rate error,,,18,0,,,0,,,0,0
+Unseen pileup,4,2,2,1,0,0,0,6,4,10,10
+Triple pileup correction,2,1,0,0,,,0,4,4,1,1
+Artificial dead time,,,0,0,3,9,0,0,0,0,0
+Pileup simulation,0,0,0,0,0,0,10,0,0,0,0
+Muon loss covariance matrix,0,0,0,0,0,0,0,0,0,0,0
+Muon loss time cuts,0,0,0,0,0,0,0,1,1,0,0
+Muon loss energy cuts,0,1,0,0,0,0,0,1,1,0,0
+Muon loss statistics,0,0,1,1,0,0,0,0,0,0,0
+Muon loss detection efficiency,0,0,4,4,0,0,0,0,0,0,0
+Muon loss scale fixed,0,0,0,0,0,0,0,0,0,0,0
+Higher-order coincidences,0,0,0,0,0,0,3,1,1,0,0
+CBO frequency change,22,9,10,11,25,25,33,12,13,21,23
+CBO decoherence envelope model,3,6,11,9,,,38,1,3,2,1
+CBO time constants,11,10,1,4,,,,,,,
+CBO time constant fixed,0,0,0,0,0,0,0,0,0,0,0
+Time randomization seed,15,17,3,3,12,14,0,12,11,7,6
+Vertical drift,0,0,0,0,0,0,208,0,0,0,0
+Muon precession period,0,2,0,0,0,0,0,0,0,0,0
+Muon lifetime,0,0,0,0,0,0,0,0,0,0,0

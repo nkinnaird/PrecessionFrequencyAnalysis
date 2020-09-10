@@ -1,0 +1,912 @@
+/////////////////////////////////////////////////////////////////////////////////////
+// Macro to perform 5 parameter and ratio fits to simulated calo hit data.
+// To run with an input file use: root -l ratioMacro.C+\(\"filepath\"\)
+// The + compiles the program if any changes were made and runs the macro interactively, and the \ escapes so bash knows to read the () and "" as actual characters.
+/////////////////////////////////////////////////////////////////////////////////////
+
+R__LOAD_LIBRARY(/cvmfs/gm2.opensciencegrid.org/prod/g-2/gm2util/v9_16_00/slf6.x86_64.e15.prof/lib/libgm2util_blinders.so)
+
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <stdlib.h>
+#include <time.h>
+#include <TGraph.h>
+#include <TGraphErrors.h>
+#include <TF1.h>
+#include <TH1.h>
+#include <TH2.h>
+#include <TDirectory.h>
+#include <TMath.h>
+#include <TCanvas.h>
+#include <TFile.h>
+#include <TLegend.h>
+#include <TLine.h>
+#include <TText.h>
+#include <TStyle.h>
+#include <TROOT.h>
+#include <TImage.h>
+#include <TRandom3.h>
+#include <sstream>
+#include <TVirtualFFT.h>
+#include <TTree.h>
+#include <TNtuple.h>
+#include <TVectorD.h>
+#include <TFitResult.h>
+#include <TSpectrum.h>
+#include <Math/Minimizer.h>
+
+#include "gm2util/blinders/Blinders.hh"
+
+#include "ratioAnalysisDefs.hh"
+#include "ratioAnalysisConfig.hh"
+#include "fiveParamFit.hh"
+#include "TmethodFit.hh"
+#include "threeParameterRatioFit.hh"
+#include "fullRatioFit.hh"
+#include "residualPlots.hh"
+#include "copyFile.hh"
+#include "pileupUtils.hh"
+
+
+using namespace std;
+
+
+int ratioMacro(string filePath)
+{
+  gROOT->SetBatch(kTRUE); // set batch mode to true for this macro so that nothing draws to the screen
+
+  // gErrorIgnoreLevel = 6000; // root output can be suppressed with this - https://root.cern.ch/root/roottalk/roottalk10/1008.html
+  // ROOT::Math::MinimizerOptions::SetDefaultMinimizer("Minuit2");
+  ROOT::Math::MinimizerOptions::SetDefaultStrategy(2);
+
+/////////////////////////////////////////////////////////////////////////////////////
+  // check config before analyzing
+
+  int configCheck = 0;
+  if(analyzeAllHistogramIters) configCheck++;
+  if(fitStartStep) configCheck++;
+  if(fitEndStep) configCheck++;
+  if(pileupMultiplerStep) configCheck++;
+  
+  if(parameterScanStep){
+    configCheck++;
+    if(find(ratioFit_added_fixedParameters.begin(), ratioFit_added_fixedParameters.end(), parameterToScan) == ratioFit_added_fixedParameters.end()){
+      cout << "Stepping over parameter: " << parameterToScan << " but it is not contained within the fixed ratio parameters vector." << endl;
+      return -1;
+    }
+    if(passParamsForward){
+      cout << "Scanning over paramter but passing paramaters forward from T method." << endl;
+      return -1;
+    }
+  }
+
+  if((useAutoPileupFactor? 1:0) + (pileupMultiplerStep? 1:0) + (useFixedPileupMultiplier? 1:0) > 1){
+    cout << "Pileup scale factor configuration set incorrectly." << endl;
+    return -1;
+  }
+
+  if(configCheck > 1){
+    cout << "Analysis configuration set incorrectly." << endl;
+    return -1;
+  }
+
+  if(setStartingParamsFromTMethod){
+    if(!(doTMethodFits || fitAddedCalos)){
+      cout << "Trying to set starting ratio or calo fit parameters from added T method fit, but not doing added T method fit." << endl;
+      return -1;
+    }
+  }
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // print out some config variables
+
+  cout << endl << "/////////////////////////////////////////////////////////////////////////////////////" << endl;
+  cout << "Analysis Config";
+  cout << endl << "/////////////////////////////////////////////////////////////////////////////////////" << endl;
+  
+  cout << "Do T Method fit: " << doTMethodFits << " last fit options: " << TMethod_lastFitOptions << endl;
+  cout << "Do R Method fit: " << doRMethodFits << " last fit options: " << RMethod_lastFitOptions << endl;
+
+  cout << "Perform added fits: " << fitAddedCalos << endl;
+
+  int numCalosToIgnore = int(sizeof(ignoreCalos)/sizeof(ignoreCalos[0]));
+  if(numCalosToIgnore > 0) { cout << "Ignoring " << numCalosToIgnore << " calos: "; for (int i = 0; i < numCalosToIgnore; ++i) cout << ignoreCalos[i] << " "; cout << endl; }
+
+  if(fitIndividualCalos.size() != 0) { cout << "Fit individual calos: "; for(auto i : fitIndividualCalos) cout << i << " "; cout << endl; }
+
+  cout << "Analyzing all iterations: " << analyzeAllHistogramIters << endl;
+  if(!analyzeAllHistogramIters) cout << "Analyzing iter: " << analyzeSpecificHistIter << " with number of passes: " << totalAnalysesPasses << endl;
+
+  cout << "Set starting parameters for calo and ratio fits from added T method result: " << setStartingParamsFromTMethod << endl;
+  cout << "Pass parameters forward from one added fit to the next added fit: " << passParamsForward << endl;
+
+  cout << "Include changing CBO frequency: " << includeChangingCBOFreq << " Include changing VW frequency: " << includeChangingVWFreq << endl;
+
+  if(doTMethodFits){
+    cout << "Tmethod fit include 2NCBO: " << TmethodFit_Include2CBO << " ACBO: " << TmethodFit_IncludeACBO << " PhiCBO: " << TmethodFit_IncludePhiCBO << " VW: " << TmethodFit_IncludeVW << " LM: " << TmethodFit_IncludeLM << endl;
+    cout << "Parameters fixed in added T method fit: "; for(auto i : TmethodFit_added_fixedParameters) cout << i << " "; cout << endl;
+    if(fitIndividualCalos.size() != 0) { cout << "Parameters fixed in calo T method fits: "; for(auto i : TmethodFit_calos_fixedParameters) cout << i << " "; cout << endl; }
+    if(fitStartStep && TmethodFit_scan_fixedParameters.size() != 0) { cout << "Parameters fixed in added T method fit start scan fits: "; for(auto i : TmethodFit_scan_fixedParameters) cout << i << " "; cout << endl; }
+  }
+  if(doRMethodFits){
+    cout << "Ratio fit include 2NCBO: " << ratioFit_Include2CBO << " ACBO: " << ratioFit_IncludeACBO << " PhiCBO: " << ratioFit_IncludePhiCBO << " VW: " << ratioFit_IncludeVW << " LM: " << ratioFit_IncludeLM << endl;
+    cout << "Parameters fixed in added R method fits: "; for(auto i : ratioFit_added_fixedParameters) cout << i << " "; cout << endl;
+    if(fitIndividualCalos.size() != 0) { cout << "Parameters fixed in calo R method fits: "; for(auto i : ratioFit_calos_fixedParameters) cout << i << " "; cout << endl; }
+    if(fitStartStep && ratioFit_scan_fixedParameters.size() != 0) { cout << "Parameters fixed in added R method fit start scan fits: "; for(auto i : ratioFit_scan_fixedParameters) cout << i << " "; cout << endl; }
+  }
+
+  cout << "Parameter to scan over: " << parameterToScan << " with step: " << parameterScanStep << endl;
+  cout << "Use automatic pileup factor: " << useAutoPileupFactor << " Use fixed pileup factor: " << useFixedPileupMultiplier << endl;
+  cout << "/////////////////////////////////////////////////////////////////////////////////////" << endl;
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // pull in main histogram input file
+  TFile *inputFile = TFile::Open(filePath.c_str());
+   if (inputFile == 0) {
+      printf("Error: cannot open file\n");
+      return 0;
+   }
+
+  TFile* outputFile = new TFile("output.root","RECREATE"); // create output file that will hold plots
+  auto topDir = gFile->mkdir("topDir"); // make top directory for output file
+
+  CopyFile(filePath.c_str()); // copy the input file into the output file
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // determine which dataset we're analyzing based on run number and set analysis config parameters appropriately
+
+  TH1F* runHist = ((TH1F*) inputFile->Get("topDir/TotalInfo/Runs"));
+
+  int minRun, maxRun;
+  minRun = runHist->GetBinLowEdge(runHist->FindFirstBinAbove());
+  maxRun = runHist->GetBinLowEdge(runHist->FindLastBinAbove());
+
+  int datasetCase = -1;
+
+  if(minRun > lowRunBound_60h && maxRun < highRunBound_60h)                datasetCase = 1; // 60h
+  else if(minRun > lowRunBound_9d && maxRun < highRunBound_9d)             datasetCase = 2; // 9d
+  else if(minRun > lowRunBound_Endgame && maxRun < highRunBound_Endgame)   datasetCase = 3; // Endgame
+  else if(minRun > lowRunBound_HighKick && maxRun < highRunBound_HighKick) datasetCase = 4; // HighKick
+  else cout << "Something is wrong with the run comparison check." << endl;
+
+  setDataset(datasetCase, trackerStationModel);
+  cout << "Using tracker station " << trackerStationModel << " model parameters." << endl;
+
+  // check number of fills before analyzing
+
+  TH1F* fillHist = ((TH1F*) inputFile->Get("topDir/TotalInfo/Fills"));
+  double fills = fillHist->GetBinContent(1);
+
+  if(!((datasetCase == 1 && fills == numFills_60h) || (datasetCase == 2 && fills == numFills_9d) || (datasetCase == 3 && fills == numFills_Endgame) || (datasetCase == 4 && fills == numFills_HighKick))){
+    cout << "Wrong number of fills in file - exiting." << endl;
+    exit(-1);
+  }
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // load separate lost muons histogram file if desired
+
+  TFile* lostMuonsFile;
+
+  if(useSeparateLostMuonsFile){
+    lostMuonsFile = TFile::Open(lostMuonsFilePath.c_str());
+     if (lostMuonsFile == 0) {
+        printf("Error: cannot open lost muons file\n");
+        return 0;
+     }
+    outputFile->cd();
+    CopyFile(lostMuonsFilePath.c_str());
+  }
+
+
+  cout << "/////////////////////////////////////////////////////////////////////////////////////" << endl;
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // pull in fit conditions from ratioAnalysisConfig.hh and input file info
+
+  std::vector<FitCondStruct> fitConditionVect;  // define vector of different fit conditions to loop over
+
+  int totalHistogramIters = (*(TVectorD*) inputFile->Get("Iters"))[0]; // total iterations in generated histograms (energy thresholds, etc.)
+
+  int totalPasses;
+  if(analyzeAllHistogramIters) totalPasses = totalHistogramIters;
+  else totalPasses = totalAnalysesPasses;
+
+  for (int i = 0; i < totalPasses; ++i)
+  {
+    string dirString;
+    if(analyzeAllHistogramIters) dirString = Form("Iter%d", i);
+    else dirString = analyzeSpecificHistIter;
+
+    fitConditionVect.emplace_back(dirString, startTimeOfFit+i*fitStartStep, endTimeOfFit+i*fitEndStep, pileupMultiplierStart+i*pileupMultiplerStep, make_pair(parameterToScan, i*parameterScanStep));
+  }
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  clock_t t; // for time profiling - put after input
+  t = clock();
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // define fit classes and prepare fit functions - only once
+
+  blinding::Blinders::fitType ftype = blinding::Blinders::kOmega_a;
+  blinding::Blinders* myBlinder = (blindResults)? new blinding::Blinders(ftype, myBlindingString) : new blinding::Blinders(ftype);
+  
+  FiveParamFit fiveParamFitClass(myBlinder);
+  
+  TmethodFit TmethodFitClass(myBlinder);
+  TmethodFitClass.setFitParamBools(includeChangingCBOFreq, includeChangingVWFreq, TmethodFit_Include2CBO, TmethodFit_IncludeACBO, TmethodFit_IncludePhiCBO, TmethodFit_IncludeVW, TmethodFit_IncludeLM, TmethodFit_IncludeBR);
+  TmethodFitClass.prepareFitFunction();
+
+  double* savedTMethodFitPars = new double[TmethodFitClass.getNumFitParams()];
+
+  ThreeParameterRatioFit threeParRatioFitClass(myBlinder);
+  
+  FullRatioFit fullRatioFitClass(myBlinder);
+  fullRatioFitClass.setFitParamBools(includeChangingCBOFreq, includeChangingVWFreq, ratioFit_Include2CBO, ratioFit_IncludeACBO, ratioFit_IncludePhiCBO, ratioFit_IncludeVW, ratioFit_IncludeLM);
+  fullRatioFitClass.prepareFitFunction();
+
+  double* savedRatioFitPars = new double[fullRatioFitClass.getNumFitParams()];
+
+  ResidualPlots residualPlotsClass;
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+TF1* firstPass_Tmethod_addedFit = 0;
+TF1* firstPass_Rmethod_addedFit = 0;
+
+// loop over fit conditions
+
+auto fitPassesDir = topDir->mkdir("FitPasses");
+
+for (int fitPass = 0; fitPass < int(fitConditionVect.size()); ++fitPass)
+{
+  cout << endl;
+  cout << "/////////////////////////////////////////////////////////////////////////////////////" << endl;
+  cout << "Fit pass: " << fitPass << endl;
+
+  // make directory for specific fit conditions
+  auto fitPassDir = fitPassesDir->mkdir(Form("FitPass%d", fitPass));
+  fitPassDir->cd();
+
+  string dirString = fitConditionVect.at(fitPass).directoryString;
+  int iterNum = stoi(dirString.substr(4));
+
+  TVectorD* histSavedParameters = (TVectorD*) inputFile->Get(("topDir/" + dirString + "/SavedParameters/parameterStore").c_str());
+  histSavedParameters->Write("parameterStore");
+
+  // TF1* gainSagFunction = (TF1*) (TVectorD*) inputFile->Get(("topDir/" + dirString + "/SavedParameters/gainSagFunction").c_str());
+  // gainSagFunction->Write("gainSagFunction");
+
+  double halfPeriodGuess = (*histSavedParameters)[0]/2.;
+  double fitStart = fitConditionVect.at(fitPass).fitStartTime;
+  double fitEnd = fitConditionVect.at(fitPass).fitEndTime;
+
+  TH1F* histForBinInfo = ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Added/Times").c_str()));
+
+  double binWidth = histForBinInfo->GetBinWidth(1);
+  int nBins = histForBinInfo->GetNbinsX();
+  double histMinTime = histForBinInfo->GetBinLowEdge(1);
+  double histMaxTime = nBins*binWidth + histMinTime;
+
+  cout << "Number of bins: " << nBins << " Bin Width: " << binWidth << " Bins in fit: " << 1 + int(fitEnd/binWidth) - int(fitStart/binWidth) << " Bin starting edge: " << histMinTime << endl;
+  cout << "Fit range: " << fitStart << " - " << fitEnd << endl;
+
+  // ntuple to record fit conditions into output file - fill further down once the pileup factor has been determined
+  TNtuple* storeConditions = new TNtuple(Form("FitConditions%d", fitPass), Form("FitConditions%d", fitPass), "totalPasses:fitPass:fitStartTime:fitEndTime:pileupScaleFactor");
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  auto addedDir = fitPassDir->mkdir("addedDir");
+  addedDir->cd();
+
+  auto added_InputDir = addedDir->mkdir("Input");
+  added_InputDir->cd();
+
+    TH1F* allEnergies = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Added/Energy").c_str()))->Clone();
+      TH1F* allEnergiesPileupSubtracted = new TH1F( "Energy_Pileup_Subtracted", "Energy_Pileup_Subtracted; Energy; Events", 1000, 0, 10000);
+
+    TH1F* allTimes = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Added/Times").c_str()))->Clone();
+      TH1F* allTimesPileupSubtracted = new TH1F("Times_Pileup_Subtracted", "Times_Pileup_Subtracted; time (ns); Events", nBins, histMinTime, histMaxTime);
+    TH1F* thresholdTimes = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Added/Times_E_Threshold").c_str()))->Clone();
+      TH1F* thresholdTimesPileupSubtracted = new TH1F("Times_E_Threshold_Pileup_Subtracted", "Times_E_Threshold_Pileup_Subtracted; time (ns); Events", nBins, histMinTime, histMaxTime);
+
+
+    TH1F* allTimesAdded_U = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Added/allTimesAdded_U").c_str()))->Clone();
+    TH1F* allTimesAdded_V = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Added/allTimesAdded_V").c_str()))->Clone();
+
+    TH1F* allTimesNumHist = new TH1F("allTimesAddedNumHist", "allTimesAddedNumHist", nBins, histMinTime, histMaxTime);
+    TH1F* allTimesDenomHist = new TH1F("allTimesAddedDenomHist", "allTimesAddedDenomHist", nBins, histMinTime, histMaxTime);
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+        auto added_pileupDir = addedDir->mkdir("Pileup");
+        added_pileupDir->cd();
+
+        TH1F* added_pileupTimes_shadow = new TH1F("added_pileupTimes_shadow", "added_pileupTimes_shadow", nBins, histMinTime, histMaxTime);
+        TH1F* added_pileupTimes_shadow_threshold = new TH1F("added_pileupTimes_shadow_threshold", "added_pileupTimes_shadow_threshold", nBins, histMinTime, histMaxTime);
+        TH1F* added_pileupEnergies_shadow = new TH1F("added_pileupEnergies_shadow", "added_pileupEnergies_shadow", 1000, 0, 10000);
+        TH1F* added_pileupTimes_U_shadow = new TH1F("added_pileupTimes_U_shadow", "added_pileupTimes_U_shadow", nBins, histMinTime, histMaxTime);
+        TH1F* added_pileupTimes_V_shadow = new TH1F("added_pileupTimes_V_shadow", "added_pileupTimes_V_shadow", nBins, histMinTime, histMaxTime);
+
+        TH1F* added_pileupErrorsNeither = new TH1F("added_pileupErrorsNeither", "added_pileupErrorsNeither", nBins, histMinTime, histMaxTime);
+        TH1F* added_pileupErrorsBoth = new TH1F("added_pileupErrorsBoth", "added_pileupErrorsBoth", nBins, histMinTime, histMaxTime);
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  auto calosDirectory = fitPassDir->mkdir("Calos");
+  calosDirectory->cd();
+
+    // create individual calorimeter directories and histograms
+    TDirectory* caloDirs[nCalos];
+
+    TH1F* caloEnergies[nCalos];
+      TH1F* caloEnergiesPileupSubtracted[nCalos];
+
+    TH1F* caloTimes[nCalos];
+      TH1F* caloTimesPileupSubtracted[nCalos];
+    TH1F* caloTimesThreshold[nCalos];
+      TH1F* caloTimesThresholdPileupSubtracted[nCalos];
+
+    TH1F* caloTimesThresholdU[nCalos];
+    TH1F* caloTimesThresholdV[nCalos];
+    TH1F* caloTimesNum[nCalos];
+    TH1F* caloTimesDenom[nCalos];
+
+      TH1F* calo_pileupEnergies[nCalos];
+      TH1F* calo_pileupTimes[nCalos];
+      TH1F* calo_pileupTimes_threshold[nCalos];
+      TH1F* calo_pileupTimes_U[nCalos];
+      TH1F* calo_pileupTimes_V[nCalos];
+
+     TH1F* calo_pileupErrorsNeither[nCalos];
+     TH1F* calo_pileupErrorsBoth[nCalos];
+
+
+    for (int caloNum = 1; caloNum <= nCalos; ++caloNum)
+    {
+      caloDirs[caloNum-1] = calosDirectory->mkdir(Form("Calo%d",caloNum));
+      caloDirs[caloNum-1]->cd();
+
+      auto inputDir = caloDirs[caloNum-1]->mkdir("Input");
+      inputDir->cd();
+
+      caloEnergies[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Calos/Calo" + to_string(caloNum) + "/Calo" + to_string(caloNum) + "_Energy").c_str()))->Clone();
+        caloEnergiesPileupSubtracted[caloNum-1] = new TH1F( Form("Calo%d_Energy_Pileup_Subtracted", caloNum), "; Energy; Events", 1000, 0, 10000);
+
+      caloTimes[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Calos/Calo" + to_string(caloNum) + "/Calo" + to_string(caloNum) + "_Times").c_str()))->Clone();
+        caloTimesPileupSubtracted[caloNum-1] = new TH1F(Form("Calo%d_Times_Pileup_Subtracted", caloNum), "; time (ns); Events", nBins, histMinTime, histMaxTime);
+      caloTimesThreshold[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Calos/Calo" + to_string(caloNum) + "/Calo" + to_string(caloNum) + "_Times_E_Threshold").c_str()))->Clone();
+        caloTimesThresholdPileupSubtracted[caloNum-1] = new TH1F(Form("Calo%d_Times_E_Threshold_Pileup_Subtracted", caloNum), "; time (ns); Events", nBins, histMinTime, histMaxTime);
+
+      caloTimesThresholdU[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Calos/Calo" + to_string(caloNum) + "/Calo" + to_string(caloNum) + "_Times_E_Threshold_U").c_str()))->Clone();
+      caloTimesThresholdV[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/Calos/Calo" + to_string(caloNum) + "/Calo" + to_string(caloNum) + "_Times_E_Threshold_V").c_str()))->Clone();
+
+      caloTimesNum[caloNum-1] = new TH1F(Form("Calo%d_Num_Hist", caloNum), Form("Calo_%d_Num_Hist", caloNum), nBins, histMinTime, histMaxTime);
+      caloTimesDenom[caloNum-1] = new TH1F(Form("Calo%d_Denom_Hist", caloNum), Form("Calo_%d_Denom_Hist", caloNum), nBins, histMinTime, histMaxTime);
+
+      // copy pileup histograms over
+
+        auto pileupDir = caloDirs[caloNum-1]->mkdir("Pileup");
+        pileupDir->cd();
+
+          calo_pileupEnergies[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/PileupHists/Calos/Calo" + to_string(caloNum) + "/pileupEnergies_shadow_Calo" + to_string(caloNum)).c_str()))->Clone();
+          calo_pileupTimes[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/PileupHists/Calos/Calo" + to_string(caloNum) + "/pileupTimes_shadow_Calo" + to_string(caloNum)).c_str()))->Clone();
+          calo_pileupTimes_threshold[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/PileupHists/Calos/Calo" + to_string(caloNum) + "/pileupTimes_shadow_threshold_Calo" + to_string(caloNum)).c_str()))->Clone();
+          calo_pileupTimes_U[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/PileupHists/Calos/Calo" + to_string(caloNum) + "/pileupTimes_U_shadow_Calo" + to_string(caloNum)).c_str()))->Clone();
+          calo_pileupTimes_V[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/PileupHists/Calos/Calo" + to_string(caloNum) + "/pileupTimes_V_shadow_Calo" + to_string(caloNum)).c_str()))->Clone();
+
+          calo_pileupErrorsNeither[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/PileupHists/Calos/Calo" + to_string(caloNum) + "/pileupErrorsNeither_shadow_Calo" + to_string(caloNum)).c_str()))->Clone();
+          calo_pileupErrorsBoth[caloNum-1] = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/PileupHists/Calos/Calo" + to_string(caloNum) + "/pileupErrorsBoth_shadow_Calo" + to_string(caloNum)).c_str()))->Clone();
+
+    } // end calo loop
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+    auto lostMuonsDir = fitPassDir->mkdir("LostMuons");
+    lostMuonsDir->cd();
+
+    TH1F* Losses_triple;
+
+    if(!useSeparateLostMuonsFile){
+      Losses_triple = (TH1F*) ((TH1F*) inputFile->Get(("topDir/" + dirString + "/LostMuons/Triples/Losses_triple").c_str()))->Clone();
+    }
+    else{
+      if(binWidth != defaultBinWidth || histMinTime != 0){
+        cout << "Input histograms have non-default binning but trying to use separate lost muons file which currently only uses default binning - exiting." << endl;
+        exit(1); // technically the program still runs without this check but I'm worried about subtleties that will cause issues - for now if using non-default binning just use the old lost muons which should be fine
+      }
+      Losses_triple = (TH1F*) ((TH1F*) lostMuonsFile->Get("topDir/AdditionalCuts/Triples/Losses_minus_quadruples_accidentals/triple_losses_spectra_minus_quadruples_accidentals"))->Clone(); // main cuts - default used
+      // Losses_triple = (TH1F*) ((TH1F*) lostMuonsFile->Get("topDir/BaseCuts/Triples/Losses/triple_losses_spectra"))->Clone(); // base cuts
+      // Losses_triple = (TH1F*) ((TH1F*) lostMuonsFile->Get("topDir/AdditionalCuts/Triples/Losses_minus_accidentals/triple_losses_spectra_minus_accidentals"))->Clone(); // main cuts - without quadruple subtraction
+      // Losses_triple = (TH1F*) ((TH1F*) lostMuonsFile->Get("topDir/AdditionalCuts/Triples/Losses_minus_quadruples/triple_losses_spectra_minus_quadruples"))->Clone(); // main cuts - without accidentals subtraction
+    }
+
+    TH1F* Losses_triple_exp = new TH1F("Losses_triple_exp", "Losses_triple_exp; time (ns); Events * e^{t/#tau}", nBins, histMinTime, histMaxTime);
+    TH1F* Losses_triple_integral = new TH1F("Losses_triple_integral", "Losses_triple_integral; time (ns); Integral of lost muon function", nBins, histMinTime, histMaxTime);
+
+    for (int bin = 1; bin <= nBins; ++bin) Losses_triple_exp->SetBinContent(bin, Losses_triple->GetBinContent(bin) * exp(Losses_triple->GetBinCenter(bin)/defaultLifetime));
+    int fitStartBin = Losses_triple_integral->FindBin(startTimeOfFit); // this should be the same for each iteration in order to normalize the fitted N values appropriately
+    for (int bin = fitStartBin; bin <= nBins; ++bin) Losses_triple_integral->SetBinContent(bin, Losses_triple_exp->Integral(fitStartBin, bin));
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+// subtract off times and energies from added hists for ignored calos
+
+    // int numCalosToIgnore = int(sizeof(ignoreCalos)/sizeof(ignoreCalos[0]));
+    TVectorD ignoredCalosStore(numCalosToIgnore);
+
+    for (int i = 0; i < numCalosToIgnore; ++i)
+    {
+      int caloNum = ignoreCalos[i];
+      ignoredCalosStore[i] = caloNum;
+
+      allEnergies->Add(caloEnergies[caloNum-1], -1);
+
+      allTimes->Add(caloTimes[caloNum-1], -1);
+      thresholdTimes->Add(caloTimesThreshold[caloNum-1], -1);
+
+      allTimesAdded_U->Add(caloTimesThresholdU[caloNum-1], -1);
+      allTimesAdded_V->Add(caloTimesThresholdV[caloNum-1], -1);
+    }
+
+    added_InputDir->cd();
+    ignoredCalosStore.Write("ignoredCalos"); // store which calos are skipped into file
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////////////    
+
+    // calculate best pileup scale factor by dividing energy histograms - do this here so that I can calculate a pileup scale factor before scaling and adding pileup hists
+
+      auto autoScaleFactor_dir = added_pileupDir->mkdir("AutoScaleFactor");
+      autoScaleFactor_dir->cd();
+
+      TH1F* temp_added_calo_pileup_energies = new TH1F("temp_added_calo_pileup_energies", "temp_added_calo_pileup_energies", 1000, 0, 10000);
+        for (int caloNum = 1; caloNum <= nCalos; ++caloNum){
+          const int* checkIgnore = std::find(ignoreCalos, ignoreCalos+numCalosToIgnore, caloNum); // skip ignored calos
+          if(checkIgnore != ignoreCalos+numCalosToIgnore) continue;
+          temp_added_calo_pileup_energies->Add(calo_pileupEnergies[caloNum-1]);
+        }
+      double auto_pileup_scaleFactor = calcPileupScaleFactor(allEnergies, temp_added_calo_pileup_energies); // method located in pileupUtils.hh
+      delete temp_added_calo_pileup_energies; // so that this isn't saved into the file
+
+        TVectorD autoFactor_store(1); // write value into file
+        autoFactor_store[0] = auto_pileup_scaleFactor;
+        autoFactor_store.Write("AutoPileupScaleFactor");
+
+      // check bool to see if I want to use the auto generated pileup scale factor or not, or the specific calculated scale factor per dataset
+
+      double appliedPileupFactor;
+      if(useAutoPileupFactor){
+       appliedPileupFactor = auto_pileup_scaleFactor;
+       fitConditionVect.at(fitPass).pileupScaleFactor = appliedPileupFactor; // overwrite value in fit condition vector
+      }
+      else if(useFixedPileupMultiplier){
+       appliedPileupFactor = fixedPileupMultiplier;
+       fitConditionVect.at(fitPass).pileupScaleFactor = appliedPileupFactor; // overwrite value in fit condition vector    
+      }
+      else appliedPileupFactor = fitConditionVect.at(fitPass).pileupScaleFactor;
+      cout << "Applied pileup scale factor is: " << appliedPileupFactor << endl;
+
+      storeConditions->Fill(totalPasses, fitPass, fitStart, fitEnd, appliedPileupFactor); // store fit conditions into file
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+      // now apply pileup scale factor (calculated or explicit) and sum/subtract pileup spectra
+
+      for (int caloNum = 1; caloNum <= nCalos; ++caloNum)
+      {
+          // scale pileup
+
+              calo_pileupEnergies[caloNum-1]->Scale(appliedPileupFactor); // scale based on fit conditions
+              calo_pileupTimes[caloNum-1]->Scale(appliedPileupFactor);
+              calo_pileupTimes_threshold[caloNum-1]->Scale(appliedPileupFactor);
+              calo_pileupTimes_U[caloNum-1]->Scale(appliedPileupFactor);
+              calo_pileupTimes_V[caloNum-1]->Scale(appliedPileupFactor);
+
+          // create pileup subtracted histograms for each calo
+              
+              caloEnergiesPileupSubtracted[caloNum-1]->Add(caloEnergies[caloNum-1]);
+              caloEnergiesPileupSubtracted[caloNum-1]->Add(calo_pileupEnergies[caloNum-1], -1);
+
+              caloTimesPileupSubtracted[caloNum-1]->Add(caloTimes[caloNum-1]);
+              caloTimesPileupSubtracted[caloNum-1]->Add(calo_pileupTimes[caloNum-1], -1);
+              caloTimesThresholdPileupSubtracted[caloNum-1]->Add(caloTimesThreshold[caloNum-1]);
+              caloTimesThresholdPileupSubtracted[caloNum-1]->Add(calo_pileupTimes_threshold[caloNum-1], -1);
+
+              caloTimesThresholdU[caloNum-1]->Add(calo_pileupTimes_U[caloNum-1], -1); // not sure if there's a point to generating UV histograms with and without pileup subtraction, so just subtract it off for now
+              caloTimesThresholdV[caloNum-1]->Add(calo_pileupTimes_V[caloNum-1], -1);
+
+              caloTimesNum[caloNum-1]->Add(caloTimesThresholdU[caloNum-1], caloTimesThresholdV[caloNum-1], -1, 1);
+              caloTimesDenom[caloNum-1]->Add(caloTimesThresholdU[caloNum-1], caloTimesThresholdV[caloNum-1]);
+
+          // construct added pileup spectra to later be subtracted off the added histograms
+
+          const int* checkIgnore = std::find(ignoreCalos, ignoreCalos+numCalosToIgnore, caloNum); // don't add ignored calos pileup to added pileup spectra
+          if(checkIgnore != ignoreCalos+numCalosToIgnore) continue;
+
+              added_pileupTimes_shadow->Add(calo_pileupTimes[caloNum-1]);
+              added_pileupTimes_shadow_threshold->Add(calo_pileupTimes_threshold[caloNum-1]);
+              added_pileupEnergies_shadow->Add(calo_pileupEnergies[caloNum-1]);
+              added_pileupTimes_U_shadow->Add(calo_pileupTimes_U[caloNum-1]);
+              added_pileupTimes_V_shadow->Add(calo_pileupTimes_V[caloNum-1]);
+
+              added_pileupErrorsNeither->Add(calo_pileupErrorsNeither[caloNum-1]);
+              added_pileupErrorsBoth->Add(calo_pileupErrorsBoth[caloNum-1]);
+
+      } // end calo loop
+
+
+          // subtract pileup for added histograms
+
+            allEnergiesPileupSubtracted->Add(allEnergies);
+            allEnergiesPileupSubtracted->Add(added_pileupEnergies_shadow, -1);
+
+            allTimesPileupSubtracted->Add(allTimes);
+            allTimesPileupSubtracted->Add(added_pileupTimes_shadow, -1);
+            thresholdTimesPileupSubtracted->Add(thresholdTimes);
+            thresholdTimesPileupSubtracted->Add(added_pileupTimes_shadow_threshold, -1);
+
+            allTimesAdded_U->Add(added_pileupTimes_U_shadow, -1);
+            allTimesAdded_V->Add(added_pileupTimes_V_shadow, -1);
+
+            allTimesNumHist->Add(allTimesAdded_U, allTimesAdded_V, -1, 1);
+            allTimesDenomHist->Add(allTimesAdded_U, allTimesAdded_V);
+
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+      // calculate error multipliers due to pileup
+
+        added_pileupDir->cd();
+
+        TH1F* errorMultiplierByBin = pileupErrorMultiplier(added_pileupErrorsBoth, added_pileupErrorsNeither, thresholdTimesPileupSubtracted);
+        // TH1F* gammaHist = pileupErrorMultiplierApproximation(added_pileupErrorsBoth, added_pileupErrorsNeither, thresholdTimesPileupSubtracted, fitStart); // can probably remove this at some point
+
+        TH1F* calo_errorMultiplierByBin[nCalos];
+        // TH1F* calo_gammaHist[nCalos]; // can probably remove this at some point
+
+          for (int caloNum = 1; caloNum <= nCalos; ++caloNum)
+          {
+            caloDirs[caloNum-1]->cd("Pileup");
+
+            calo_errorMultiplierByBin[caloNum-1] = pileupErrorMultiplier(calo_pileupErrorsBoth[caloNum-1], calo_pileupErrorsNeither[caloNum-1], caloTimesThresholdPileupSubtracted[caloNum-1]);
+            // calo_gammaHist[caloNum-1] = pileupErrorMultiplierApproximation(calo_pileupErrorsBoth[caloNum-1], calo_pileupErrorsNeither[caloNum-1], caloTimesThresholdPileupSubtracted[caloNum-1], fitStart);
+          }
+
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////////////
+// Now get to the fitting part
+/////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // set specifics in fit class for each fit
+
+  fiveParamFitClass.setFitRange(fitStart, fitEnd);
+
+  TmethodFitClass.setBinWidth(binWidth);
+  TmethodFitClass.setFitRange(fitStart, fitEnd);
+  TmethodFitClass.setLostMuonHists(Losses_triple, Losses_triple_integral);
+
+  threeParRatioFitClass.setBinWidth(binWidth);
+  threeParRatioFitClass.setFitRange(fitStart, fitEnd);
+
+  fullRatioFitClass.setBinWidth(binWidth);
+  fullRatioFitClass.setFitRange(fitStart, fitEnd);
+  fullRatioFitClass.classForFunc->setHalfPeriod(halfPeriodGuess);
+  fullRatioFitClass.setLostMuonIntegral(Losses_triple_integral);
+  fullRatioFitClass.setScanParameterChange(fitConditionVect.at(fitPass).parScan.second);
+
+  // ranges for fft for a different range than the function range
+  double fft_range_min = fitStart;           // timeCutLow + g2Period/2.;
+  double fft_range_max = fitStart + 30000.; // timeCutHigh - g2Period/2.;
+
+/////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////
+  
+// Fit times added together
+
+TF1* Tmethod_addedFit = 0; // define here so the ratio fit and T method calo fits can access it if necessary for fixing parameters
+
+if(fitAddedCalos){
+
+  if(doTMethodFits){
+
+      auto added_HistDir = addedDir->mkdir("FiveParam");
+      added_HistDir->cd();
+
+        TH1F* allTimesAdded = (TH1F*) thresholdTimesPileupSubtracted->Clone("allTimesAdded"); // currently only the pileup subtracted data is fit
+        modifyHistErrors(allTimesAdded, errorMultiplierByBin);
+        allTimesAdded->ResetStats();
+
+            fiveParamFitClass.fiveParameterFitMethod(allTimesAdded);
+            auto fiveAddedFit = allTimesAdded->GetFunction("fiveParamFit");
+            cout << endl << "Added 5 Param Fit p-value is: " << fiveAddedFit->GetProb() << " chi2/ndf: " << fiveAddedFit->GetChisquare()/fiveAddedFit->GetNDF() << " R error: " << fiveAddedFit->GetParError(3) << endl;
+
+            residualPlotsClass.makeResidualPlots("AddedTimes", allTimesAdded, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+            residualPlotsClass.makeResidualPlots("AddedTimes", allTimesAdded, "residual_otherRange", fft_range_min, fft_range_max);
+
+    /////////////////////////////////////////////////////////////////////////////////////
+
+      auto added_Tmethod_Dir = addedDir->mkdir("TMethod");
+      added_Tmethod_Dir->cd();
+
+        TH1F* allTimesAdded_TMethod = (TH1F*) thresholdTimesPileupSubtracted->Clone("allTimesAdded_TMethod"); // currently only the pileup subtracted data is fit
+        modifyHistErrors(allTimesAdded_TMethod, errorMultiplierByBin);
+        allTimesAdded_TMethod->ResetStats();
+
+            TmethodFitClass.clearFunctionParams();
+            TmethodFitClass.setFiveParamFunction(fiveAddedFit);
+            if(fitPass != 0 && fitStartStep != 0){ // only for a fit start scan
+            // if(fitPass != 0 && TmethodFit_scan_fixedParameters.size() != 0){ // more general, can use this one in other circumstances but all use cases have not been considered
+              TmethodFitClass.setFixedParameters(TmethodFit_scan_fixedParameters); // overwrite the fixed parameters vector
+              if(setStartingParamsFromTMethod) TmethodFitClass.setTMethodFunction(firstPass_Tmethod_addedFit); // this line for if I don't pass the parameters forward but still want to start the parameters from the first fit
+            }
+            TmethodFitClass.setStartingFitParameters();
+
+            // if(iterNum == 2) TmethodFitClass.fillDiffParLimits(cbo_Phi_phi_string, 0, 2);
+
+            double* TMethodFitPars;
+            if(fitPass == 0 || passParamsForward == false) TMethodFitPars = TmethodFitClass.doTMethodFit(allTimesAdded_TMethod);
+            else TMethodFitPars = TmethodFitClass.fitAllTMethodParameters(allTimesAdded_TMethod, savedTMethodFitPars, false);
+
+
+            Tmethod_addedFit = allTimesAdded_TMethod->GetFunction("TmethodFitFunc");
+            cout << "Added T Method Fit p-value is: " << Tmethod_addedFit->GetProb() << " chi2/ndf: " << Tmethod_addedFit->GetChisquare()/Tmethod_addedFit->GetNDF() << " R: " << Tmethod_addedFit->GetParameter(3)  << " R error: " << Tmethod_addedFit->GetParError(3) << endl;
+
+            residualPlotsClass.makeResidualPlots("AddedTimes", allTimesAdded_TMethod, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+            residualPlotsClass.makeResidualPlots("AddedTimes", allTimesAdded_TMethod, "residual_otherRange", fft_range_min, fft_range_max);
+  
+      for (int i = 0; i < TmethodFitClass.getNumFitParams(); ++i) savedTMethodFitPars[i] = TMethodFitPars[i]; // store parameters from fit for next fit
+      if(fitPass == 0) firstPass_Tmethod_addedFit = Tmethod_addedFit; // copy first pass T method added fit
+
+  } // end if doTMethodFits
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+  if(doRMethodFits){
+
+      auto added_RatioDir = addedDir->mkdir("ThreeParamRatio");
+      added_RatioDir->cd();
+
+            auto addedRatioGraph = threeParRatioFitClass.createRatioGraph(allTimesNumHist, allTimesDenomHist); // currently only the pileup subtracted data is fit
+            modifyGraphErrors(addedRatioGraph, errorMultiplierByBin); // gammaHist for extrapolated errors
+            threeParRatioFitClass.fitMethod(addedRatioGraph);
+
+            addedRatioGraph->SetTitle("Added Times Ratio Graph; Time (ns); R (ratio - 3 param)");
+            addedRatioGraph->SetName("Added_Times_Ratio_Graph");
+            addedRatioGraph->Write();
+            
+            auto addedRatioFit = addedRatioGraph->GetFunction("threeParamRatioFit");
+            if(addedRatioFit != 0) cout << "Added 3 Param Ratio Fit p-value is: " << addedRatioFit->GetProb() << " chi2/ndf: " << addedRatioFit->GetChisquare()/addedRatioFit->GetNDF() << " R error: " << addedRatioFit->GetParError(1) << endl;
+
+            residualPlotsClass.makeResidualPlots("RatioAddedTimes", addedRatioGraph, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+            residualPlotsClass.makeResidualPlots("RatioAddedTimes", addedRatioGraph, "residual_otherRange", fft_range_min, fft_range_max);
+
+        // can fit denominator to get at tau and some cbo stuff but I don't really use it
+
+        auto denomDir = added_RatioDir->mkdir("Denominator");
+        denomDir->cd();
+
+              threeParRatioFitClass.denominatorFitMethod(allTimesDenomHist, binWidth);
+              allTimesDenomHist->Write("Denominator_Fitted");
+              TH1F* denomFitFFT = residualPlotsClass.makeResidualPlots("Denominator", allTimesDenomHist, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+/*
+              double cbo_freq = residualPlotsClass.findPeaks(denomFitFFT);
+*/
+    /////////////////////////////////////////////////////////////////////////////////////
+
+      auto fullRatio_Dir = addedDir->mkdir("FullRatio");
+      fullRatio_Dir->cd();
+
+            auto addedFullRatio_Graph = threeParRatioFitClass.createRatioGraph(allTimesNumHist, allTimesDenomHist); // currently only the pileup subtracted data is fit
+            modifyGraphErrors(addedFullRatio_Graph, errorMultiplierByBin); // gammaHist for extrapolated errors
+
+            fullRatioFitClass.clearFunctionParams();
+            fullRatioFitClass.setThreeParamRatioFunction(addedRatioFit);
+
+            if(setStartingParamsFromTMethod) fullRatioFitClass.setTMethodFunction(Tmethod_addedFit, TmethodFitClass.getParamIndicesMap());
+            if(fitPass != 0 && fitStartStep != 0){ // only for a fit start scan
+            // if(fitPass != 0 && ratioFit_scan_fixedParameters.size() != 0){ // more general, can use this one in other circumstances but all use cases have not been considered
+              fullRatioFitClass.setFixedParameters(ratioFit_scan_fixedParameters); // overwrite the fixed parameters vector
+              if(setStartingParamsFromFirstRMethodFit && !passParamsForward) fullRatioFitClass.setFullRatioFunction(firstPass_Rmethod_addedFit); // this line for if I don't pass the parameters forward but still want to start the parameters from the first ratio fit
+            }
+            fullRatioFitClass.setStartingFitParameters();
+
+            // if(iterNum == 4) fullRatioFitClass.fillDiffParLimits(cbo_N2_phi_string, 2.5, 5);
+
+            double* fullRatioFitPars;
+            if(fitPass == 0 || passParamsForward == false) fullRatioFitPars = fullRatioFitClass.doFullRatioFit(addedFullRatio_Graph);  
+            else fullRatioFitPars = fullRatioFitClass.fitAllParameters(addedFullRatio_Graph, savedRatioFitPars, false);
+
+            addedFullRatio_Graph->SetTitle("Added Times Full Ratio Graph; Time (ns); R (ratio - full)");
+            addedFullRatio_Graph->SetName("Added_Times_Full_Ratio_Graph");
+            addedFullRatio_Graph->Write();
+            
+            auto addedFullRatioFit = addedFullRatio_Graph->GetFunction("fullRatioFitFunc");
+            if(addedFullRatioFit != 0) cout << "Added Full Ratio Fit p-value is: " << addedFullRatioFit->GetProb() << " chi2/ndf: " << addedFullRatioFit->GetChisquare()/addedFullRatioFit->GetNDF() << " R: " << addedFullRatioFit->GetParameter(1) << " R error: " << addedFullRatioFit->GetParError(1) << endl;
+
+            residualPlotsClass.makeResidualPlots("FullRatioAddedTimes", addedFullRatio_Graph, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+            residualPlotsClass.makeResidualPlots("FullRatioAddedTimes", addedFullRatio_Graph, "residual_otherRange", fft_range_min, fft_range_max);
+
+        for (int i = 0; i < fullRatioFitClass.getNumFitParams(); ++i) savedRatioFitPars[i] = fullRatioFitPars[i]; // store parameters from fit for next fit
+        if(fitPass == 0) firstPass_Rmethod_addedFit = addedFullRatioFit; // copy first pass R method added fit
+
+  } // end if doRMethodFits
+
+} // end if fitAddedCalos
+
+
+/////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // fit specified calorimeters
+
+  if(fitIndividualCalos.size() > 0)
+  {
+    fiveParamFitClass.setFitRange(fitStart, caloFitEndTime);
+    TmethodFitClass.setFitRange(fitStart, caloFitEndTime);
+    threeParRatioFitClass.setFitRange(fitStart, caloFitEndTime);
+    fullRatioFitClass.setFitRange(fitStart, caloFitEndTime);
+  }
+
+    for (auto caloNum : fitIndividualCalos)
+    {
+
+      if(doTMethodFits){
+
+    /////////////////////////////////////////////////////////////////////////////////////
+    // perform individual 5 parameter hist fits
+
+        caloDirs[caloNum-1]->cd();
+        auto histDir = caloDirs[caloNum-1]->mkdir("FiveParam");
+        histDir->cd();
+
+        TH1F* caloTimesClone = ((TH1F*) caloTimesThresholdPileupSubtracted[caloNum-1]->Clone(("Calo" + to_string(caloNum) + "_Threshold_Clone").c_str()));
+        modifyHistErrors(caloTimesClone, calo_errorMultiplierByBin[caloNum-1]);
+        caloTimesClone->ResetStats();
+
+        fiveParamFitClass.fiveParameterFitMethod(caloTimesClone);
+        auto fiveHistFit = caloTimesClone->GetFunction("fiveParamFit");
+        cout << endl << "Calo: " << caloNum << " Hist 5 param Fit p-value is: " << fiveHistFit->GetProb() << " chi2/ndf: " << fiveHistFit->GetChisquare()/fiveHistFit->GetNDF() << endl;
+
+        residualPlotsClass.makeResidualPlots(Form("Calo_%d", caloNum), caloTimesClone, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+        residualPlotsClass.makeResidualPlots(Form("Calo_%d", caloNum), caloTimesClone, "residual_otherRange", fft_range_min, fft_range_max);
+
+    /////////////////////////////////////////////////////////////////////////////////////
+    // perform individual T method fits 
+
+        TmethodFitClass.setFixedParameters(TmethodFit_calos_fixedParameters); // overwrite the fixed parameters vector
+
+        caloDirs[caloNum-1]->cd();
+        auto Tmethod_dir = caloDirs[caloNum-1]->mkdir("TMethod");
+        Tmethod_dir->cd();
+
+        TH1F* caloTimesClone_TMethod = ((TH1F*) caloTimesThresholdPileupSubtracted[caloNum-1]->Clone(("Calo" + to_string(caloNum) + "_Threshold_Clone").c_str()));
+        modifyHistErrors(caloTimesClone_TMethod, calo_errorMultiplierByBin[caloNum-1]);
+        caloTimesClone_TMethod->ResetStats();
+
+        TmethodFitClass.clearFunctionParams();
+        TmethodFitClass.setFiveParamFunction(fiveHistFit);
+        if(setStartingParamsFromTMethod) TmethodFitClass.setTMethodFunction(Tmethod_addedFit);
+
+        // TmethodFitClass.setStartingFitParameters(10.);
+        TmethodFitClass.setStartingFitParameters();
+
+        // if(caloNum == 3) TmethodFitClass.fillDiffParLimits(cbo_w_string, 2.336, 2.34);
+        // if(caloNum == 17) TmethodFitClass.fillDiffParLimits(cbo_N2_phi_string, -pi, pi);
+
+        TmethodFitClass.doTMethodFit(caloTimesClone_TMethod);
+        auto Tmethod_fit = caloTimesClone_TMethod->GetFunction("TmethodFitFunc");
+        cout << "Calo: " << caloNum << " T Method Fit p-value is: " << Tmethod_fit->GetProb() << " chi2/ndf: " << Tmethod_fit->GetChisquare()/Tmethod_fit->GetNDF() << endl;
+
+        residualPlotsClass.makeResidualPlots(Form("Calo_%d", caloNum), caloTimesClone_TMethod, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+        residualPlotsClass.makeResidualPlots(Form("Calo_%d", caloNum), caloTimesClone_TMethod, "residual_otherRange", fft_range_min, fft_range_max);
+
+    /////////////////////////////////////////////////////////////////////////////////////
+
+      } // end if doTMethodFits
+
+      if(doRMethodFits){
+ 
+    /////////////////////////////////////////////////////////////////////////////////////
+    // perform individual ratio fits
+
+        caloDirs[caloNum-1]->cd();
+        auto ratioDir = caloDirs[caloNum-1]->mkdir("ThreeParamRatio");
+        ratioDir->cd();
+
+            TGraphErrors* ratioGraph = threeParRatioFitClass.createRatioGraph(caloTimesNum[caloNum-1], caloTimesDenom[caloNum-1]);
+            modifyGraphErrors(ratioGraph, calo_errorMultiplierByBin[caloNum-1]); // calo_gammaHist[caloNum-1] for extrapolated errors
+            threeParRatioFitClass.fitMethod(ratioGraph);
+
+            ratioGraph->SetTitle(Form("Ratio Graph Calo %d; Time (ns); R (ratio - 3 param)", caloNum));
+            ratioGraph->SetName(Form("Ratio_TGraph_Calo_%d", caloNum));
+            ratioGraph->Write();
+
+            auto ratioFit = ratioGraph->GetFunction("threeParamRatioFit");
+            cout << "Calo: " << caloNum << " 3 Param Ratio Fit p-value is: " << ratioFit->GetProb() << " chi2/ndf: " << ratioFit->GetChisquare()/ratioFit->GetNDF() << endl;
+
+            residualPlotsClass.makeResidualPlots(Form("Ratio_Calo_%d", caloNum), ratioGraph, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+            residualPlotsClass.makeResidualPlots(Form("Ratio_Calo_%d", caloNum), ratioGraph, "residual_otherRange", fft_range_min, fft_range_max);
+/*
+        auto caloDenomDir = ratioDir->mkdir("Denominator");
+        caloDenomDir->cd();
+
+              threeParRatioFitClass.denominatorFitMethod(caloTimesDenom[caloNum-1]);
+              caloTimesDenom[caloNum-1]->Write(Form("Calo%d_Denom_Fitted", caloNum));
+              residualPlotsClass.makeResidualPlots(Form("Calo%d_Denom", caloNum), caloTimesDenom[caloNum-1], "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+*/
+    /////////////////////////////////////////////////////////////////////////////////////
+    // perform individual ratio fits
+
+        fullRatioFitClass.setFixedParameters(ratioFit_calos_fixedParameters); // overwrite the fixed parameters vector
+
+        caloDirs[caloNum-1]->cd();
+        auto fullRatioDir = caloDirs[caloNum-1]->mkdir("FullRatio");
+        fullRatioDir->cd();
+
+            TGraphErrors* fullRatio_Graph = threeParRatioFitClass.createRatioGraph(caloTimesNum[caloNum-1], caloTimesDenom[caloNum-1]);
+            modifyGraphErrors(fullRatio_Graph, calo_errorMultiplierByBin[caloNum-1]); // calo_gammaHist[caloNum-1] for extrapolated errors
+
+            fullRatioFitClass.clearFunctionParams();
+            fullRatioFitClass.setThreeParamRatioFunction(ratioFit);
+            if(setStartingParamsFromTMethod) fullRatioFitClass.setTMethodFunction(Tmethod_addedFit, TmethodFitClass.getParamIndicesMap());
+            
+            // fullRatioFitClass.setStartingFitParameters(10.);
+            fullRatioFitClass.setStartingFitParameters();
+
+            // if(caloNum == 11) fullRatioFitClass.fillDiffParLimits(cbo_N_amp_string, 0.01, 0.04);
+            // if(caloNum == 21) fullRatioFitClass.fillDiffParLimits(cbo_Phi_phi_string, 2, 6);
+
+            fullRatioFitClass.doFullRatioFit(fullRatio_Graph);
+
+            fullRatio_Graph->SetTitle(Form("Full Ratio Graph Calo %d; Time (ns); R (ratio - full)", caloNum));
+            fullRatio_Graph->SetName(Form("Full_Ratio_TGraph_Calo_%d", caloNum));
+            fullRatio_Graph->Write();
+
+            auto fullRatioFit = fullRatio_Graph->GetFunction("fullRatioFitFunc");
+            cout << "Calo: " << caloNum << " Full Ratio Fit p-value is: " << fullRatioFit->GetProb() << " chi2/ndf: " << fullRatioFit->GetChisquare()/fullRatioFit->GetNDF() << " Full ratio fit R error: " << fullRatioFit->GetParError(1) << endl;
+
+            residualPlotsClass.makeResidualPlots(Form("Full_Ratio_Calo_%d", caloNum), fullRatio_Graph, "residual_fitRange", fitConditionVect.at(fitPass).fitStartTime, fitConditionVect.at(fitPass).fitEndTime);
+            residualPlotsClass.makeResidualPlots(Form("Full_Ratio_Calo_%d", caloNum), fullRatio_Graph, "residual_otherRange", fft_range_min, fft_range_max);
+
+    /////////////////////////////////////////////////////////////////////////////////////
+
+      } // end if doRMethodFits
+
+    } // end calo for loop
+
+} // end overall fit pass loops
+
+/////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////
+
+  // for time profiling - put before output
+  if(timeCheck){
+    t = clock() - t;
+    printf ("It took me %f seconds.\n", ((float)t)/CLOCKS_PER_SEC);
+  }
+
+/////////////////////////////////////////////////////////////////////////////////////
+
+      outputFile->Write();
+      delete outputFile;
+
+  return 1;
+}

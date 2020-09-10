@@ -1,0 +1,13 @@
+*.root
+*.log
+*.exe
+*~
+*.log
+*.root
+*.tmp
+*_C.d
+*_C.so
+*.pcm
+._*
+.DS_Store
+*.png
